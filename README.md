@@ -38,8 +38,9 @@ I. Features
 | `scan_enabled` | bool | Enable the automatic scheduled scan (default true). |
 | `notify_on_first_scan` | bool | Notify about posts found on the first scan (default false). |
 | `max_posts_per_check` | int | Max new posts notified per creator per scan (default 5). |
-| `creators` | template list | One entry per creator: `campaign_id` (required), `display_name` and optional `rss_url`. |
+| `creators` | template list | One entry per creator: `campaign_id` (required), `display_name`, optional `rss_url` and optional `page_url`. |
 | `rss_url` (per creator) | string | Optional RSS feed URL. When set, the creator's posts are read from this feed instead of the Patreon API (no API token needed). |
+| `page_url` (per creator) | string | Optional public creator page URL (e.g. `https://www.patreon.com/cw/DrunkPoetry`). When set, the plugin scrapes the public posts page for titles/links — works without an API token and is the way to follow creators you do not own. Only public post metadata is read. |
 | `telegram_bot_token` | string | Bot token from @BotFather. |
 | `telegram_chat_ids` | list | Telegram group/channel IDs, e.g. `-1001234567890`. |
 | `message_template` | text | Notification template (see placeholders below). |
@@ -119,6 +120,12 @@ itself still works on older versions (the button is simply unavailable).
   Patreon's official member feeds only contain audio/video posts; text-only
   creators (like many writing communities) usually have no such feed. Use
   this for podcast/member feeds or any authorized feed URL.
+- **Web page source (`page_url`)**: set `page_url` to a creator's public
+  Patreon page to follow creators you do not own (e.g.
+  `https://www.patreon.com/cw/DrunkPoetry`). The plugin scrapes the public
+  posts list once per scan and only reads post titles and links. This works
+  without any Patreon token but relies on the public page layout; please use
+  it responsibly and in line with Patreon's terms of service.
 - When `telegram_parse_mode` is set, escape reserved characters in your
   template (see the Telegram Bot API documentation).
 - Follow the Patreon API terms of service and respect rate limits.

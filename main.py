@@ -17,6 +17,7 @@ Requirements: AstrBot >= 4.10.4 (template_list config schema support)
 """
 
 import asyncio
+import html.parser
 import json
 import re
 import string
@@ -335,6 +336,150 @@ class RssClient:
         return parse_rss_feed(xml_text, limit)
 
 
+PATREON_WEB_BASE = "https://www.patreon.com"
+POST_LINK_RE = re.compile(
+    r"(?:https?://(?:www\.)?patreon\.com)?/(?:[^/\s]+/)?posts/([a-zA-Z0-9_-]+)-(\d+)"
+)
+# Fallback: bare post links without the trailing id pattern.
+POST_LINK_FALLBACK_RE = re.compile(
+    r"(?:https?://(?:www\.)?patreon\.com)?/(?:[^/\s]+/)?posts/[a-zA-Z0-9_-]+"
+)
+
+
+def _absolute_post_url(href: str) -> str:
+    """Normalise a (possibly relative) Patreon post URL."""
+    href = href.strip()
+    if href.startswith("http://") or href.startswith("https://"):
+        return href
+    if href.startswith("/"):
+        return PATREON_WEB_BASE + href
+    return href
+
+
+class WebScrapeError(Exception):
+    """Raised when the creator page cannot be fetched or parsed."""
+
+
+class _PostLinkParser(html.parser.HTMLParser):
+    """Collect post links and their anchor text from an HTML page."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._in_anchor = False
+        self._current_href = ""
+        self._text_parts: list[str] = []
+        self.posts: list[dict[str, str]] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag != "a":
+            return
+        href = ""
+        for name, value in attrs:
+            if name == "href" and value:
+                href = value
+        if POST_LINK_RE.search(href) or POST_LINK_FALLBACK_RE.search(href):
+            self._in_anchor = True
+            self._current_href = _absolute_post_url(href)
+            self._text_parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self._in_anchor:
+            self._text_parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag != "a" or not self._in_anchor:
+            return
+        text = " ".join("".join(self._text_parts).split())
+        if text:
+            self.posts.append({"url": self._current_href, "title": text})
+        self._in_anchor = False
+        self._current_href = ""
+
+
+def _post_id_from_url(url: str) -> str:
+    """Extract the numeric post ID from a Patreon post URL."""
+    match = POST_LINK_RE.search(url or "")
+    if match:
+        return match.group(2)
+    return url
+
+
+def parse_posts_page(html_text: str, limit: int) -> list[dict[str, Any]]:
+    """Parse a Patreon creator page into the latest post metadata.
+
+    I. Walk the HTML with a lightweight parser
+        1. Collect anchors that point to /posts/<slug>-<id>
+        2. Keep the anchor text as the post title
+    II. Deduplicate and cap the list
+        1. The same post may appear multiple times on the page
+        2. Only the newest `limit` posts are returned
+
+    Args:
+        html_text: Raw page HTML.
+        limit: Maximum number of posts to return.
+
+    Returns:
+        A list of post dicts with id/title/url (published_at is empty).
+    """
+    parser = _PostLinkParser()
+    parser.feed(html_text)
+
+    seen: set[str] = set()
+    posts: list[dict[str, Any]] = []
+    for item in parser.posts:
+        url = item["url"]
+        post_id = _post_id_from_url(url)
+        if not url or post_id in seen:
+            continue
+        seen.add(post_id)
+        posts.append(
+            {
+                "id": post_id,
+                "title": item["title"] or "(no title)",
+                "url": url,
+                "content": "",
+                "published_at": "",
+            }
+        )
+        if len(posts) >= max(1, min(int(limit), 50)):
+            break
+    return posts
+
+
+class WebScrapeClient:
+    """Fetch the latest post titles and links from a creator page."""
+
+    def __init__(self, timeout_seconds: int) -> None:
+        self._timeout_seconds = max(5, timeout_seconds)
+
+    async def fetch_latest_posts(
+        self, session: aiohttp.ClientSession, page_url: str, limit: int
+    ) -> list[dict[str, Any]]:
+        """Fetch and parse the posts page of a creator.
+
+        The page URL is normalised to the /posts listing when needed.
+        """
+        normalised = page_url.strip().rstrip("/")
+        if not normalised.endswith("/posts"):
+            normalised += "/posts"
+        timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
+        try:
+            async with session.get(
+                normalised, headers={"User-Agent": PLUGIN_NAME}, timeout=timeout
+            ) as resp:
+                if resp.status != 200:
+                    body = (await resp.text())[:300]
+                    raise WebScrapeError(
+                        f"Creator page returned HTTP {resp.status} ({body})"
+                    )
+                html_text = await resp.text()
+        except WebScrapeError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise WebScrapeError(f"Creator page request failed: {exc}") from exc
+        return parse_posts_page(html_text, limit)
+
+
 class TelegramNotifier:
     """Send text messages through the Telegram Bot API."""
 
@@ -590,7 +735,7 @@ def split_markdown_messages(table: str) -> list[str]:
     "astrbot_plugin_patreon_watch_dog",
     "zexuan.peng",
     "Track Patreon creator updates and notify Telegram groups.",
-    "1.4.0",
+    "1.5.0",
 )
 class PatreonWatchDog(Star):
     """AstrBot plugin that watches Patreon creators for updates."""
@@ -602,6 +747,7 @@ class PatreonWatchDog(Star):
         self._scheduler_task: asyncio.Task | None = None
         self._patreon: PatreonClient | None = None
         self._rss: RssClient | None = None
+        self._web: WebScrapeClient | None = None
         self._notifier: TelegramNotifier | None = None
 
         # Register the backend endpoint used by the "One-click test report"
@@ -626,6 +772,7 @@ class PatreonWatchDog(Star):
             self._cfg_str("patreon_access_token"), timeout_seconds
         )
         self._rss = RssClient(timeout_seconds)
+        self._web = WebScrapeClient(timeout_seconds)
         self._notifier = TelegramNotifier(
             self._cfg_str("telegram_bot_token"),
             self._cfg_str("telegram_parse_mode", ""),
@@ -693,7 +840,7 @@ class PatreonWatchDog(Star):
 
         I. Collect entries that carry a valid campaign ID
         II. Fall back to the campaign ID when no display name is set
-        III. Keep an optional RSS URL that overrides the API source
+        III. Keep the optional RSS URL and creator page URL sources
         """
         creators: list[dict[str, str]] = []
         for item in self._cfg_list("creators"):
@@ -704,11 +851,13 @@ class PatreonWatchDog(Star):
                 continue
             display_name = str(item.get("display_name") or "").strip()
             rss_url = str(item.get("rss_url") or "").strip()
+            page_url = str(item.get("page_url") or "").strip()
             creators.append(
                 {
                     "campaign_id": campaign_id,
                     "display_name": display_name or campaign_id,
                     "rss_url": rss_url,
+                    "page_url": page_url,
                 }
             )
         return creators
@@ -796,7 +945,11 @@ class PatreonWatchDog(Star):
         if (
             session is None
             or self._notifier is None
-            or (self._patreon is None and self._rss is None)
+            or (
+                self._patreon is None
+                and self._rss is None
+                and self._web is None
+            )
         ):
             summary["errors"].append("Plugin clients are not initialised.")
             await self._persist_scan_result(summary)
@@ -886,13 +1039,20 @@ class PatreonWatchDog(Star):
         """Fetch posts from the configured source for one creator.
 
         I. RSS source wins when rss_url is configured
-        II. Otherwise fall back to the Patreon API
+        II. The public creator page is scraped when page_url is set
+        III. Otherwise fall back to the Patreon API
         """
         if creator.get("rss_url"):
             if self._rss is None:
                 raise RuntimeError("RSS client is not initialised.")
             return await self._rss.fetch_latest_posts(
                 session, creator["rss_url"], limit
+            )
+        if creator.get("page_url"):
+            if self._web is None:
+                raise RuntimeError("Web scrape client is not initialised.")
+            return await self._web.fetch_latest_posts(
+                session, creator["page_url"], limit
             )
         if self._patreon is None:
             raise RuntimeError("Patreon client is not initialised.")
@@ -982,7 +1142,11 @@ class PatreonWatchDog(Star):
             return report
         if (
             self._notifier is None
-            or (self._patreon is None and self._rss is None)
+            or (
+                self._patreon is None
+                and self._rss is None
+                and self._web is None
+            )
         ):
             report["errors"].append("Plugin clients are not initialised.")
             return report
@@ -1001,6 +1165,12 @@ class PatreonWatchDog(Star):
                             f"{creator['display_name']} ({creator['campaign_id']}): "
                             "RSS feed returned no items. Check that the rss_url "
                             "is valid and publicly reachable."
+                        )
+                    elif creator.get("page_url"):
+                        note = (
+                            f"{creator['display_name']} ({creator['campaign_id']}): "
+                            "Creator page returned no posts. Check that the page_url "
+                            "is correct and publicly reachable."
                         )
                     else:
                         note = (

@@ -52,6 +52,12 @@
             "description": "Optional RSS feed URL for this creator",
             "default": "",
             "hint": "When set, the plugin reads posts from this RSS feed instead of the Patreon API. Useful for podcast/member feeds or other authorized sources (no API token needed)."
+          },
+          "page_url": {
+            "type": "string",
+            "description": "Optional public Patreon page URL of the creator",
+            "default": "",
+            "hint": "When set, the plugin scrapes the public posts page for titles and links (e.g. https://www.patreon.com/cw/DrunkPoetry). Works without an API token; only public post metadata is read."
           }
         }
       }
