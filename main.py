@@ -21,7 +21,9 @@ import json
 import re
 import string
 import unicodedata
+import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from typing import Any
 
 import aiohttp
@@ -194,6 +196,143 @@ class PatreonClient:
                 }
             )
         return posts
+
+
+class RssFeedError(Exception):
+    """Raised when an RSS feed cannot be fetched or parsed."""
+
+
+def _rss_parse_datetime(value: str) -> str:
+    """Convert an RSS/Atom timestamp into an ISO UTC string.
+
+    I. Try ISO 8601 first (Atom feeds use updated)
+    II. Fall back to RFC 2822 (RSS 2.0 uses pubDate)
+    """
+    value = (value or "").strip()
+    if not value:
+        return ""
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc).isoformat()
+    except ValueError:
+        pass
+    try:
+        parsed = parsedate_to_datetime(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat()
+    except (TypeError, ValueError):
+        return value
+
+
+def parse_rss_feed(xml_text: str, limit: int) -> list[dict[str, Any]]:
+    """Parse an RSS 2.0 (or Atom) feed into normalised posts.
+
+    I. Parse the XML document
+        1. RSS 2.0 items live under channel/item
+        2. Atom entries live under feed/entry
+    II. Normalise each item
+        1. id falls back to the item link
+        2. published_at is converted from RFC 2822 to ISO UTC
+        3. description is kept as the post content
+
+    Args:
+        xml_text: Raw feed content.
+        limit: Maximum number of items to return.
+
+    Returns:
+        A list of post dicts with id/title/url/content/published_at.
+    """
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError as exc:
+        raise RssFeedError(f"Invalid RSS XML: {exc}") from exc
+
+    items: list[ET.Element] = []
+    if root.tag.endswith("rss"):
+        for channel in root.findall("channel"):
+            items.extend(channel.findall("item"))
+    elif root.tag.endswith("feed"):
+        for entry in root.findall("{http://www.w3.org/2005/Atom}entry"):
+            items.append(entry)
+
+    posts: list[dict[str, Any]] = []
+    atom_ns = "{http://www.w3.org/2005/Atom}"
+    for item in items[:max(1, min(int(limit), 100))]:
+        title = (item.findtext("title") or "").strip()
+        if not title:
+            title = (item.findtext(f"{atom_ns}title") or "").strip()
+        link_el = item.find("link")
+        if link_el is None:
+            link_el = item.find(f"{atom_ns}link")
+        link = (link_el.text or "").strip() if link_el is not None else ""
+        # Atom namespace link may carry an href attribute instead.
+        if not link:
+            link = (link_el.get("href") or "").strip() if link_el is not None else ""
+        guid_el = item.find("guid")
+        if guid_el is None:
+            guid_el = item.find(f"{atom_ns}id")
+        guid = (guid_el.text or "").strip() if guid_el is not None else ""
+        pub_date = (
+            item.findtext("pubDate")
+            or item.findtext("published")
+            or item.findtext(f"{atom_ns}published")
+            or item.findtext("updated")
+            or item.findtext(f"{atom_ns}updated")
+            or ""
+        ).strip()
+        description = (
+            item.findtext("description")
+            or item.findtext("content")
+            or item.findtext(f"{atom_ns}content")
+            or ""
+        ).strip()
+
+        posts.append(
+            {
+                "id": guid or link or title,
+                "title": title or "(no title)",
+                "url": link,
+                "content": description,
+                "published_at": _rss_parse_datetime(pub_date),
+            }
+        )
+    return posts
+
+
+class RssClient:
+    """Minimal async client that turns an RSS feed into post dicts."""
+
+    def __init__(self, timeout_seconds: int) -> None:
+        self._timeout_seconds = max(5, timeout_seconds)
+
+    async def fetch_latest_posts(
+        self, session: aiohttp.ClientSession, rss_url: str, limit: int
+    ) -> list[dict[str, Any]]:
+        """Fetch and parse the latest items of an RSS feed.
+
+        Args:
+            session: Shared aiohttp session.
+            rss_url: RSS feed URL (may contain auth parameters).
+            limit: Maximum number of posts to fetch.
+
+        Returns:
+            A list of post dicts in feed order.
+        """
+        timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
+        try:
+            async with session.get(rss_url, timeout=timeout) as resp:
+                if resp.status != 200:
+                    body = (await resp.text())[:300]
+                    raise RssFeedError(
+                        f"RSS feed returned HTTP {resp.status} ({body})"
+                    )
+                xml_text = await resp.text()
+        except RssFeedError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise RssFeedError(f"RSS feed request failed: {exc}") from exc
+        return parse_rss_feed(xml_text, limit)
 
 
 class TelegramNotifier:
@@ -451,7 +590,7 @@ def split_markdown_messages(table: str) -> list[str]:
     "astrbot_plugin_patreon_watch_dog",
     "zexuan.peng",
     "Track Patreon creator updates and notify Telegram groups.",
-    "1.3.0",
+    "1.4.0",
 )
 class PatreonWatchDog(Star):
     """AstrBot plugin that watches Patreon creators for updates."""
@@ -462,6 +601,7 @@ class PatreonWatchDog(Star):
         self._http_session: aiohttp.ClientSession | None = None
         self._scheduler_task: asyncio.Task | None = None
         self._patreon: PatreonClient | None = None
+        self._rss: RssClient | None = None
         self._notifier: TelegramNotifier | None = None
 
         # Register the backend endpoint used by the "One-click test report"
@@ -485,6 +625,7 @@ class PatreonWatchDog(Star):
         self._patreon = PatreonClient(
             self._cfg_str("patreon_access_token"), timeout_seconds
         )
+        self._rss = RssClient(timeout_seconds)
         self._notifier = TelegramNotifier(
             self._cfg_str("telegram_bot_token"),
             self._cfg_str("telegram_parse_mode", ""),
@@ -552,6 +693,7 @@ class PatreonWatchDog(Star):
 
         I. Collect entries that carry a valid campaign ID
         II. Fall back to the campaign ID when no display name is set
+        III. Keep an optional RSS URL that overrides the API source
         """
         creators: list[dict[str, str]] = []
         for item in self._cfg_list("creators"):
@@ -561,8 +703,13 @@ class PatreonWatchDog(Star):
             if not campaign_id:
                 continue
             display_name = str(item.get("display_name") or "").strip()
+            rss_url = str(item.get("rss_url") or "").strip()
             creators.append(
-                {"campaign_id": campaign_id, "display_name": display_name or campaign_id}
+                {
+                    "campaign_id": campaign_id,
+                    "display_name": display_name or campaign_id,
+                    "rss_url": rss_url,
+                }
             )
         return creators
 
@@ -646,7 +793,11 @@ class PatreonWatchDog(Star):
             return summary
 
         session = self._http_session
-        if session is None or self._patreon is None or self._notifier is None:
+        if (
+            session is None
+            or self._notifier is None
+            or (self._patreon is None and self._rss is None)
+        ):
             summary["errors"].append("Plugin clients are not initialised.")
             await self._persist_scan_result(summary)
             return summary
@@ -656,8 +807,8 @@ class PatreonWatchDog(Star):
 
         for creator in creators:
             try:
-                posts = await self._patreon.get_latest_posts(
-                    session, creator["campaign_id"], SCAN_LIMIT
+                posts = await self._fetch_posts_for_creator(
+                    session, creator, SCAN_LIMIT
                 )
                 new_posts = await self._select_new_posts(creator, posts)
                 if new_posts:
@@ -725,6 +876,29 @@ class PatreonWatchDog(Star):
         """Persist the newest post IDs so the next scan can diff them."""
         ids = [post["id"] for post in posts[:MAX_TRACKED_POSTS]]
         await self.put_kv_data(f"{KV_KEY_LAST_SEEN}{campaign_id}", json.dumps(ids))
+
+    async def _fetch_posts_for_creator(
+        self,
+        session: aiohttp.ClientSession,
+        creator: dict[str, str],
+        limit: int,
+    ) -> list[dict[str, Any]]:
+        """Fetch posts from the configured source for one creator.
+
+        I. RSS source wins when rss_url is configured
+        II. Otherwise fall back to the Patreon API
+        """
+        if creator.get("rss_url"):
+            if self._rss is None:
+                raise RuntimeError("RSS client is not initialised.")
+            return await self._rss.fetch_latest_posts(
+                session, creator["rss_url"], limit
+            )
+        if self._patreon is None:
+            raise RuntimeError("Patreon client is not initialised.")
+        return await self._patreon.get_latest_posts(
+            session, creator["campaign_id"], limit
+        )
 
     def _build_template_values(
         self, creator: dict[str, str], post: dict[str, Any]
@@ -806,7 +980,10 @@ class PatreonWatchDog(Star):
         if not chat_ids:
             report["errors"].append("No Telegram chat IDs configured.")
             return report
-        if self._patreon is None or self._notifier is None:
+        if (
+            self._notifier is None
+            or (self._patreon is None and self._rss is None)
+        ):
             report["errors"].append("Plugin clients are not initialised.")
             return report
 
@@ -815,16 +992,24 @@ class PatreonWatchDog(Star):
         report["creators"] = len(creators)
         for creator in creators:
             try:
-                posts = await self._patreon.get_latest_posts(
-                    session, creator["campaign_id"], REPORT_POSTS_LIMIT
+                posts = await self._fetch_posts_for_creator(
+                    session, creator, REPORT_POSTS_LIMIT
                 )
                 if not posts:
-                    report["notices"].append(
-                        f"{creator['display_name']} ({creator['campaign_id']}): "
-                        "Patreon API returned 0 posts. This is expected when the "
-                        "token cannot read that campaign (it must own the campaign "
-                        "or be explicitly authorized by its creator)."
-                    )
+                    if creator.get("rss_url"):
+                        note = (
+                            f"{creator['display_name']} ({creator['campaign_id']}): "
+                            "RSS feed returned no items. Check that the rss_url "
+                            "is valid and publicly reachable."
+                        )
+                    else:
+                        note = (
+                            f"{creator['display_name']} ({creator['campaign_id']}): "
+                            "Patreon API returned 0 posts. This is expected when the "
+                            "token cannot read that campaign (it must own the campaign "
+                            "or be explicitly authorized by its creator)."
+                        )
+                    report["notices"].append(note)
                 for post in posts:
                     rows.append(
                         {

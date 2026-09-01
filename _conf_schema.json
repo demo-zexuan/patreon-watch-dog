@@ -46,6 +46,12 @@
             "type": "string",
             "description": "Display name shown in notifications",
             "default": ""
+          },
+          "rss_url": {
+            "type": "string",
+            "description": "Optional RSS feed URL for this creator",
+            "default": "",
+            "hint": "When set, the plugin reads posts from this RSS feed instead of the Patreon API. Useful for podcast/member feeds or other authorized sources (no API token needed)."
           }
         }
       }

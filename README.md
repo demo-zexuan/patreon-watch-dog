@@ -38,7 +38,8 @@ I. Features
 | `scan_enabled` | bool | Enable the automatic scheduled scan (default true). |
 | `notify_on_first_scan` | bool | Notify about posts found on the first scan (default false). |
 | `max_posts_per_check` | int | Max new posts notified per creator per scan (default 5). |
-| `creators` | template list | One entry per creator: `campaign_id` (required) and `display_name`. |
+| `creators` | template list | One entry per creator: `campaign_id` (required), `display_name` and optional `rss_url`. |
+| `rss_url` (per creator) | string | Optional RSS feed URL. When set, the creator's posts are read from this feed instead of the Patreon API (no API token needed). |
 | `telegram_bot_token` | string | Bot token from @BotFather. |
 | `telegram_chat_ids` | list | Telegram group/channel IDs, e.g. `-1001234567890`. |
 | `message_template` | text | Notification template (see placeholders below). |
@@ -113,6 +114,11 @@ itself still works on older versions (the button is simply unavailable).
   an **empty post list** or `401`. To track a third-party creator you need
   an access token that the creator has explicitly authorized for that
   campaign.
+- **RSS data source**: set `rss_url` on a creator entry to read posts from an
+  RSS/Atom feed instead of the Patreon API (no token required). Note that
+  Patreon's official member feeds only contain audio/video posts; text-only
+  creators (like many writing communities) usually have no such feed. Use
+  this for podcast/member feeds or any authorized feed URL.
 - When `telegram_parse_mode` is set, escape reserved characters in your
   template (see the Telegram Bot API documentation).
 - Follow the Patreon API terms of service and respect rate limits.
