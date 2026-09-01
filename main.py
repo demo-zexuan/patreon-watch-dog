@@ -888,6 +888,10 @@ class PatreonWatchDog(Star):
         if subcommand == "report":
             report = await self._run_report()
             yield event.plain_result(self._format_report_result(report))
+            # Show the Markdown table directly in the chat as code blocks
+            # (the table is also sent to the configured Telegram chats).
+            for message in split_markdown_messages(report.get("markdown", "")):
+                yield event.plain_result(message)
             return
         if subcommand == "campaigns":
             yield event.plain_result(await self._campaigns_text())
@@ -906,7 +910,7 @@ class PatreonWatchDog(Star):
             "Patreon Watch Dog commands (admin only):\n"
             "/patreon status - show plugin status\n"
             "/patreon scan - run a scan now\n"
-            "/patreon report - collect posts and send a Markdown table report\n"
+            "/patreon report - show and send a Markdown table test report\n"
             "/patreon campaigns - list Patreon campaigns the token can access\n"
             "/patreon test - send a test notification to the configured chats\n"
             "/patreon help - show this help"

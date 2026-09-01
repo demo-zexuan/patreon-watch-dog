@@ -81,7 +81,8 @@ All commands require admin permissions (see the AstrBot permission settings):
 - `/patreon status` — show the current status and the last scan result
 - `/patreon scan` — run a scan immediately
 - `/patreon report` — collect the latest post titles of every configured
-  creator, build a Markdown table and send it to the configured Telegram chats
+  creator, build a Markdown table, **show it in the chat** and send it to the
+  configured Telegram chats
 - `/patreon campaigns` — list campaigns accessible to your token
 - `/patreon test` — send a test notification to every configured chat
 - `/patreon help` — show command help
