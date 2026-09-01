@@ -47,6 +47,7 @@ except ImportError:  # pragma: no cover - depends on the AstrBot version
 # ---------------------------------------------------------------------------
 
 PLUGIN_NAME = "astrbot_plugin_patreon_watch_dog"
+PLUGIN_VERSION = "1.5.0"
 
 PATREON_API_BASE = "https://www.patreon.com/api/oauth2/v2"
 TELEGRAM_API_BASE = "https://api.telegram.org"
@@ -1319,7 +1320,7 @@ class PatreonWatchDog(Star):
             pass
 
         lines = [
-            "Patreon Watch Dog status:",
+            f"Patreon Watch Dog (v{PLUGIN_VERSION}) status:",
             f"- Scan enabled: {self._cfg_bool('scan_enabled', True)}",
             f"- Interval: {self._cfg_int('scan_interval_minutes', 30)} min",
             f"- Creators tracked: {len(creators)}",
@@ -1370,7 +1371,7 @@ class PatreonWatchDog(Star):
         template_snippet = template.replace("\n", " ").strip()
 
         lines = [
-            "Patreon Watch Dog configuration:",
+            f"Patreon Watch Dog (v{PLUGIN_VERSION}) configuration:",
             "- Patreon API token: "
             f"{self._mask_secret(self._cfg_str('patreon_access_token'))}",
             f"- Scan enabled: {self._cfg_bool('scan_enabled', True)}",
@@ -1380,7 +1381,15 @@ class PatreonWatchDog(Star):
             f"- Creators ({len(creators)}):",
         ]
         for creator in creators:
-            lines.append(f"  • {creator['campaign_id']} ({creator['display_name']})")
+            source = "api"
+            if creator.get("rss_url"):
+                source = "rss"
+            elif creator.get("page_url"):
+                source = "web"
+            lines.append(
+                f"  • {creator['campaign_id']} ({creator['display_name']}) "
+                f"[source: {source}]"
+            )
         lines.append(
             "- Telegram bot token: "
             f"{self._mask_secret(self._cfg_str('telegram_bot_token'))}"
