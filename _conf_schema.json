@@ -1,0 +1,84 @@
+{
+  "patreon_access_token": {
+    "type": "string",
+    "description": "Patreon API v2 access token",
+    "hint": "OAuth2 token created at https://www.patreon.com/portal/api/access-token with the 'campaigns' scope. Required to query creator posts.",
+    "obvious_hint": true
+  },
+  "scan_interval_minutes": {
+    "type": "int",
+    "description": "Scan interval in minutes",
+    "hint": "How often the plugin polls Patreon for new posts (default: 30).",
+    "default": 30
+  },
+  "scan_enabled": {
+    "type": "bool",
+    "description": "Enable the automatic scheduled scan",
+    "default": true
+  },
+  "notify_on_first_scan": {
+    "type": "bool",
+    "description": "Notify about posts found on the very first scan",
+    "hint": "When false, the first scan only records the current latest posts without sending notifications.",
+    "default": false
+  },
+  "max_posts_per_check": {
+    "type": "int",
+    "description": "Maximum new posts to notify per creator per scan",
+    "default": 5
+  },
+  "creators": {
+    "type": "template_list",
+    "description": "Patreon creators (campaigns) to track",
+    "hint": "Add one template entry per creator. campaign_id is mandatory; display_name is used in notification templates.",
+    "templates": {
+      "patreon_creator": {
+        "name": "Patreon Creator",
+        "hint": "A single creator to watch",
+        "display_item": "campaign_id",
+        "items": {
+          "campaign_id": {
+            "type": "string",
+            "description": "Patreon campaign ID",
+            "hint": "Numeric ID from the creator page URL. Use /patreon campaigns to list IDs your token can access."
+          },
+          "display_name": {
+            "type": "string",
+            "description": "Display name shown in notifications",
+            "default": ""
+          }
+        }
+      }
+    }
+  },
+  "telegram_bot_token": {
+    "type": "string",
+    "description": "Telegram bot token",
+    "hint": "Create a bot with @BotFather and paste its token here.",
+    "obvious_hint": true
+  },
+  "telegram_chat_ids": {
+    "type": "list",
+    "description": "Telegram chat (group) IDs for notifications",
+    "hint": "One ID per line, e.g. -1001234567890. Find an ID with @userinfobot or the bot API getUpdates endpoint.",
+    "default": []
+  },
+  "message_template": {
+    "type": "text",
+    "description": "Notification message template",
+    "hint": "Placeholders: {creator_name}, {post_title}, {post_url}, {published_at}, {post_type}, {post_content}",
+    "default": "🔔 {creator_name} posted a new update!\n📄 {post_title}\n🔗 {post_url}"
+  },
+  "telegram_parse_mode": {
+    "type": "string",
+    "description": "Telegram message parse mode",
+    "hint": "HTML, Markdown, MarkdownV2, or empty for plain text. When set, escape reserved characters in your template.",
+    "default": "",
+    "options": ["", "HTML", "Markdown", "MarkdownV2"]
+  },
+  "request_timeout_seconds": {
+    "type": "int",
+    "description": "HTTP request timeout in seconds",
+    "default": 30
+  }
+}

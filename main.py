@@ -1,0 +1,724 @@
+"""
+Patreon Watch Dog (AstrBot plugin)
+
+Track Patreon creator updates and notify configured Telegram groups
+on a configurable schedule.
+
+I. Features
+    1. Track multiple Patreon creators (campaigns) through templates
+    2. Poll the Patreon API v2 on a configurable interval
+    3. Send customisable notifications to multiple Telegram chats
+    4. Provide admin commands for status, manual scan and tests
+
+Requirements: AstrBot >= 4.10.4 (template_list config schema support)
+
+@author zexuan.peng
+@created 2026-09-01
+"""
+
+import asyncio
+import json
+import re
+import string
+from datetime import datetime, timezone
+from typing import Any
+
+import aiohttp
+
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star, register
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+PATREON_API_BASE = "https://www.patreon.com/api/oauth2/v2"
+TELEGRAM_API_BASE = "https://api.telegram.org"
+
+DEFAULT_MESSAGE_TEMPLATE = (
+    "🔔 {creator_name} posted a new update!\n"
+    "📄 {post_title}\n"
+    "🔗 {post_url}"
+)
+
+STARTUP_DELAY_SECONDS = 10
+MAX_TRACKED_POSTS = 20
+MAX_CONTENT_CHARS = 500
+SCAN_LIMIT = 10
+
+KV_KEY_LAST_SEEN = "last_seen_posts:"
+KV_KEY_LAST_SCAN_TIME = "last_scan_time"
+KV_KEY_LAST_SCAN_RESULT = "last_scan_result"
+
+_COMMAND_PREFIX_RE = re.compile(r"^[/\\!]?patreon\b", re.IGNORECASE)
+
+
+class PatreonApiError(Exception):
+    """Raised when the Patreon API returns an unexpected response."""
+
+
+class PatreonClient:
+    """Minimal async client for the Patreon API v2."""
+
+    def __init__(self, access_token: str, timeout_seconds: int) -> None:
+        self._access_token = access_token
+        self._timeout_seconds = max(5, timeout_seconds)
+
+    def _headers(self) -> dict[str, str]:
+        return {"Authorization": f"Bearer {self._access_token}"}
+
+    async def _get_json(
+        self,
+        session: aiohttp.ClientSession,
+        url: str,
+        params: dict[str, str],
+        action: str,
+    ) -> dict[str, Any]:
+        """Perform an authorised GET request and return the JSON payload.
+
+        I. Send the request
+            1. Attach the bearer token
+            2. Apply the per-request timeout
+        II. Validate the response
+            1. Non-200 responses raise PatreonApiError
+            2. Malformed JSON raises PatreonApiError
+        """
+        timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
+        try:
+            async with session.get(
+                url, params=params, headers=self._headers(), timeout=timeout
+            ) as resp:
+                if resp.status != 200:
+                    body = (await resp.text())[:300]
+                    raise PatreonApiError(
+                        f"Patreon API failed to {action}: HTTP {resp.status} ({body})"
+                    )
+                return await resp.json()
+        except PatreonApiError:
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise PatreonApiError(f"Patreon API request failed to {action}: {exc}") from exc
+
+    async def get_campaigns(
+        self, session: aiohttp.ClientSession
+    ) -> list[dict[str, str]]:
+        """List campaigns the token can access.
+
+        Args:
+            session: Shared aiohttp session.
+
+        Returns:
+            A list of {"id", "name", "url"} dictionaries.
+        """
+        payload = await self._get_json(
+            session,
+            f"{PATREON_API_BASE}/campaigns",
+            {"fields[campaign]": "name,url,creation_name"},
+            "list campaigns",
+        )
+        campaigns: list[dict[str, str]] = []
+        for item in payload.get("data", []):
+            attributes = item.get("attributes", {}) or {}
+            campaigns.append(
+                {
+                    "id": str(item.get("id") or ""),
+                    "name": str(
+                        attributes.get("creation_name")
+                        or attributes.get("name")
+                        or ""
+                    ),
+                    "url": str(attributes.get("url") or ""),
+                }
+            )
+        return campaigns
+
+    async def get_latest_posts(
+        self, session: aiohttp.ClientSession, campaign_id: str, limit: int
+    ) -> list[dict[str, Any]]:
+        """Fetch the most recent posts of a campaign.
+
+        I. Call the posts endpoint
+            1. Request the fields used by the template system
+            2. Sort newest first and limit the page size
+        II. Normalise each post into a plain dictionary
+
+        Args:
+            session: Shared aiohttp session.
+            campaign_id: Numeric Patreon campaign ID.
+            limit: Maximum number of posts to fetch.
+
+        Returns:
+            A list of post dicts with id/title/url/content/published_at/post_type.
+        """
+        page_size = max(1, min(int(limit), 50))
+        payload = await self._get_json(
+            session,
+            f"{PATREON_API_BASE}/campaigns/{campaign_id}/posts",
+            {
+                "fields[post]": "title,url,content,published_at,post_type,is_public",
+                "sort": "-published_at",
+                "page[size]": str(page_size),
+            },
+            f"fetch posts of campaign {campaign_id}",
+        )
+        posts: list[dict[str, Any]] = []
+        for item in payload.get("data", []):
+            attributes = item.get("attributes", {}) or {}
+            posts.append(
+                {
+                    "id": str(item.get("id") or ""),
+                    "title": str(attributes.get("title") or "(no title)"),
+                    "url": str(attributes.get("url") or ""),
+                    "content": str(attributes.get("content") or ""),
+                    "published_at": str(attributes.get("published_at") or ""),
+                    "post_type": str(attributes.get("post_type") or ""),
+                }
+            )
+        return posts
+
+
+class TelegramNotifier:
+    """Send text messages through the Telegram Bot API."""
+
+    def __init__(self, bot_token: str, parse_mode: str, timeout_seconds: int) -> None:
+        self._bot_token = bot_token
+        self._parse_mode = parse_mode
+        self._timeout_seconds = max(5, timeout_seconds)
+
+    async def send_text(
+        self, session: aiohttp.ClientSession, chat_id: str, text: str
+    ) -> bool:
+        """Send a text message to a chat.
+
+        I. Build the request
+            1. chat_id accepts an integer ID or a channel username
+            2. parse_mode is only included when configured
+        II. Handle the response
+            1. A successful response returns True
+            2. HTTP 429 retries once after retry_after seconds
+            3. Any other failure returns False
+
+        Returns:
+            True when Telegram confirms the message was sent.
+        """
+        url = f"{TELEGRAM_API_BASE}/bot{self._bot_token}/sendMessage"
+        payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if self._parse_mode:
+            payload["parse_mode"] = self._parse_mode
+
+        timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
+        for attempt in range(2):
+            try:
+                async with session.post(url, json=payload, timeout=timeout) as resp:
+                    data = await resp.json()
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                logger.warning("Telegram sendMessage request failed: %s", exc)
+                return False
+
+            if resp.status == 200 and data.get("ok"):
+                return True
+
+            if resp.status == 429:
+                retry_after = int(
+                    (data.get("parameters") or {}).get("retry_after", 3)
+                )
+                if retry_after <= 30:
+                    await asyncio.sleep(retry_after)
+                    continue
+
+            logger.error(
+                "Telegram sendMessage failed: HTTP %s (%s)",
+                resp.status,
+                str(data)[:300],
+            )
+            return False
+        return False
+
+
+class _SafeFormatter(string.Formatter):
+    """Formatter that renders missing template fields as empty strings."""
+
+    def get_field(self, field_name: str, args: tuple, kwargs: dict) -> tuple:
+        try:
+            return super().get_field(field_name, args, kwargs)
+        except (KeyError, AttributeError):
+            return "", None
+
+
+def render_template(template: str, values: dict[str, str]) -> str:
+    """Render a notification template with the given values.
+
+    Missing placeholders render as empty strings so a broken
+    template never crashes the scanner.
+
+    Args:
+        template: User-defined message template.
+        values: Placeholder name to value mapping.
+
+    Returns:
+        The rendered message text.
+    """
+    try:
+        return _SafeFormatter().vformat(template, (), values)
+    except Exception:
+        return values.get("post_url", template)
+
+
+@register(
+    "astrbot_plugin_patreon_watch_dog",
+    "zexuan.peng",
+    "Track Patreon creator updates and notify Telegram groups.",
+    "1.0.0",
+)
+class PatreonWatchDog(Star):
+    """AstrBot plugin that watches Patreon creators for updates."""
+
+    def __init__(self, context: Context, config: AstrBotConfig) -> None:
+        super().__init__(context)
+        self.config = config
+        self._http_session: aiohttp.ClientSession | None = None
+        self._scheduler_task: asyncio.Task | None = None
+        self._patreon: PatreonClient | None = None
+        self._notifier: TelegramNotifier | None = None
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    async def initialize(self) -> None:
+        """Set up HTTP clients and start the scheduler when enabled."""
+        timeout_seconds = self._cfg_int("request_timeout_seconds", 30)
+        self._http_session = aiohttp.ClientSession()
+        self._patreon = PatreonClient(
+            self._cfg_str("patreon_access_token"), timeout_seconds
+        )
+        self._notifier = TelegramNotifier(
+            self._cfg_str("telegram_bot_token"),
+            self._cfg_str("telegram_parse_mode", ""),
+            timeout_seconds,
+        )
+
+        if self._cfg_bool("scan_enabled", True):
+            self._scheduler_task = asyncio.create_task(
+                self._scheduler_loop(), name="patreon-watch-dog-scheduler"
+            )
+            logger.info(
+                "Patreon Watch Dog scheduler started (interval: %s min).",
+                self._cfg_int("scan_interval_minutes", 30),
+            )
+        else:
+            logger.info("Patreon Watch Dog scheduler is disabled.")
+
+    async def terminate(self) -> None:
+        """Cancel the scheduler task and close the HTTP session."""
+        if self._scheduler_task and not self._scheduler_task.done():
+            self._scheduler_task.cancel()
+            try:
+                await self._scheduler_task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.exception("Patreon Watch Dog scheduler stopped with errors.")
+        if self._http_session and not self._http_session.closed:
+            await self._http_session.close()
+
+    # ------------------------------------------------------------------
+    # Config helpers
+    # ------------------------------------------------------------------
+
+    def _cfg_str(self, key: str, default: str = "") -> str:
+        try:
+            value = self.config.get(key, default)
+            return str(value) if value is not None else default
+        except Exception:
+            return default
+
+    def _cfg_int(self, key: str, default: int) -> int:
+        try:
+            return max(1, int(self.config.get(key, default) or default))
+        except Exception:
+            return default
+
+    def _cfg_bool(self, key: str, default: bool) -> bool:
+        try:
+            return bool(self.config.get(key, default))
+        except Exception:
+            return default
+
+    def _cfg_list(self, key: str) -> list[Any]:
+        try:
+            value = self.config.get(key, [])
+            if isinstance(value, list):
+                return value
+            return [value] if value is not None else []
+        except Exception:
+            return []
+
+    def _get_creators(self) -> list[dict[str, str]]:
+        """Normalise the configured creator templates.
+
+        I. Collect entries that carry a valid campaign ID
+        II. Fall back to the campaign ID when no display name is set
+        """
+        creators: list[dict[str, str]] = []
+        for item in self._cfg_list("creators"):
+            if not isinstance(item, dict):
+                continue
+            campaign_id = str(item.get("campaign_id") or "").strip()
+            if not campaign_id:
+                continue
+            display_name = str(item.get("display_name") or "").strip()
+            creators.append(
+                {"campaign_id": campaign_id, "display_name": display_name or campaign_id}
+            )
+        return creators
+
+    def _get_chat_ids(self) -> list[str]:
+        """Normalise the configured Telegram chat IDs."""
+        chat_ids: list[str] = []
+        for item in self._cfg_list("telegram_chat_ids"):
+            value = str(item).strip()
+            if value:
+                chat_ids.append(value)
+        return chat_ids
+
+    # ------------------------------------------------------------------
+    # Scheduler
+    # ------------------------------------------------------------------
+
+    async def _scheduler_loop(self) -> None:
+        """Poll Patreon periodically until the plugin is stopped.
+
+        I. Wait for the platform to be fully ready
+        II. Poll forever
+            1. Run one scan and protect it against unexpected errors
+            2. Sleep for the configured interval (read every cycle)
+        """
+        await asyncio.sleep(STARTUP_DELAY_SECONDS)
+        while True:
+            try:
+                await self._run_scan("scheduled")
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Patreon Watch Dog scheduled scan failed.")
+
+            interval_seconds = self._cfg_int("scan_interval_minutes", 30) * 60
+            try:
+                await asyncio.sleep(interval_seconds)
+            except asyncio.CancelledError:
+                raise
+
+    # ------------------------------------------------------------------
+    # Scan pipeline
+    # ------------------------------------------------------------------
+
+    async def _run_scan(self, trigger: str = "manual") -> dict[str, Any]:
+        """Scan every configured creator and notify about new posts.
+
+        I. Validate configuration
+            1. Creators and Telegram destinations must be configured
+        II. Scan each creator
+            1. Fetch the latest posts
+            2. Pick posts that have not been seen before
+            3. Notify every configured chat for each new post
+            4. Remember the newest post IDs
+        III. Persist and return the scan summary
+
+        Args:
+            trigger: "scheduled", "manual" or another source label.
+
+        Returns:
+            The scan summary used for logging and status display.
+        """
+        summary: dict[str, Any] = {
+            "trigger": trigger,
+            "time": self._now_iso(),
+            "creators": 0,
+            "new_posts": 0,
+            "sent": 0,
+            "failed": 0,
+            "errors": [],
+        }
+
+        creators = self._get_creators()
+        chat_ids = self._get_chat_ids()
+        if not creators:
+            summary["errors"].append("No creators configured.")
+            await self._persist_scan_result(summary)
+            return summary
+        if not chat_ids:
+            summary["errors"].append("No Telegram chat IDs configured.")
+            await self._persist_scan_result(summary)
+            return summary
+
+        session = self._http_session
+        if session is None or self._patreon is None or self._notifier is None:
+            summary["errors"].append("Plugin clients are not initialised.")
+            await self._persist_scan_result(summary)
+            return summary
+
+        template = self._cfg_str("message_template", DEFAULT_MESSAGE_TEMPLATE)
+        summary["creators"] = len(creators)
+
+        for creator in creators:
+            try:
+                posts = await self._patreon.get_latest_posts(
+                    session, creator["campaign_id"], SCAN_LIMIT
+                )
+                new_posts = await self._select_new_posts(creator, posts)
+                if new_posts:
+                    summary["new_posts"] += len(new_posts)
+                    for post in new_posts:
+                        text = render_template(
+                            template, self._build_template_values(creator, post)
+                        )
+                        for chat_id in chat_ids:
+                            ok = await self._notifier.send_text(session, chat_id, text)
+                            if ok:
+                                summary["sent"] += 1
+                            else:
+                                summary["failed"] += 1
+                await self._remember_last_seen(creator["campaign_id"], posts)
+            except Exception as exc:
+                logger.warning(
+                    "Failed to scan creator %s: %s", creator["campaign_id"], exc
+                )
+                summary["errors"].append(f"{creator['campaign_id']}: {exc}")
+
+        await self._persist_scan_result(summary)
+        return summary
+
+    async def _select_new_posts(
+        self, creator: dict[str, str], posts: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Determine posts that have not been notified yet.
+
+        I. Load the previously seen post IDs
+        II. Decide the candidate posts
+            1. The first scan only records unless notify_on_first_scan is true
+            2. Later scans use unseen posts only
+        III. Sort chronologically and cap the batch size
+        """
+        campaign_id = creator["campaign_id"]
+        seen_key = f"{KV_KEY_LAST_SEEN}{campaign_id}"
+        seen_raw = await self.get_kv_data(seen_key, None)
+        is_first_scan = seen_raw is None
+
+        seen_ids: set[str] = set()
+        if seen_raw:
+            try:
+                parsed = json.loads(seen_raw)
+                if isinstance(parsed, list):
+                    seen_ids = {str(item) for item in parsed}
+            except (TypeError, ValueError):
+                seen_ids = set()
+
+        if is_first_scan:
+            if not self._cfg_bool("notify_on_first_scan", False):
+                return []
+            candidates = list(posts)
+        else:
+            candidates = [post for post in posts if post["id"] not in seen_ids]
+
+        # Publish older posts first so updates arrive in chronological order.
+        candidates.sort(key=lambda post: post.get("published_at") or "")
+        limit = self._cfg_int("max_posts_per_check", 5)
+        return candidates[:limit]
+
+    async def _remember_last_seen(
+        self, campaign_id: str, posts: list[dict[str, Any]]
+    ) -> None:
+        """Persist the newest post IDs so the next scan can diff them."""
+        ids = [post["id"] for post in posts[:MAX_TRACKED_POSTS]]
+        await self.put_kv_data(f"{KV_KEY_LAST_SEEN}{campaign_id}", json.dumps(ids))
+
+    def _build_template_values(
+        self, creator: dict[str, str], post: dict[str, Any]
+    ) -> dict[str, str]:
+        """Build the placeholder values exposed to the message template."""
+        return {
+            "creator_name": creator["display_name"],
+            "post_title": post.get("title", ""),
+            "post_url": post.get("url", ""),
+            "published_at": self._format_published_at(post.get("published_at", "")),
+            "post_type": post.get("post_type", ""),
+            "post_content": self._truncate(post.get("content", ""), MAX_CONTENT_CHARS),
+        }
+
+    @staticmethod
+    def _format_published_at(value: str) -> str:
+        """Convert an ISO timestamp into a human-readable UTC string."""
+        if not value:
+            return ""
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        except ValueError:
+            return value
+
+    @staticmethod
+    def _truncate(text: str, limit: int) -> str:
+        """Trim long post content so Telegram messages stay readable."""
+        text = text or ""
+        return text if len(text) <= limit else text[:limit] + "…"
+
+    @staticmethod
+    def _now_iso() -> str:
+        return datetime.now(timezone.utc).isoformat()
+
+    async def _persist_scan_result(self, summary: dict[str, Any]) -> None:
+        """Store the latest scan time and summary in the plugin KV store."""
+        try:
+            await self.put_kv_data(KV_KEY_LAST_SCAN_TIME, summary.get("time", ""))
+            await self.put_kv_data(
+                KV_KEY_LAST_SCAN_RESULT, json.dumps(summary, ensure_ascii=False)
+            )
+        except Exception as exc:
+            logger.warning("Failed to persist scan summary: %s", exc)
+
+    # ------------------------------------------------------------------
+    # Commands (admin only)
+    # ------------------------------------------------------------------
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("patreon")
+    async def patreon_command(self, event: AstrMessageEvent):
+        """Patreon Watch Dog admin commands.
+
+        Usage: /patreon <subcommand>
+        Subcommands: help, status, scan, campaigns, test
+        """
+        text = (event.message_str or "").strip()
+        subcommand = _COMMAND_PREFIX_RE.sub("", text).strip().split(" ", 1)[0].lower()
+        args = _COMMAND_PREFIX_RE.sub("", text).strip().split(" ", 1)
+
+        if not subcommand or subcommand == "help":
+            yield event.plain_result(self._help_text())
+            return
+        if subcommand == "status":
+            yield event.plain_result(await self._status_text())
+            return
+        if subcommand == "scan":
+            summary = await self._run_scan("manual")
+            yield event.plain_result(self._format_summary(summary))
+            return
+        if subcommand == "campaigns":
+            yield event.plain_result(await self._campaigns_text())
+            return
+        if subcommand == "test":
+            yield event.plain_result(await self._test_notification(args))
+            return
+        yield event.plain_result(self._help_text())
+
+    # ------------------------------------------------------------------
+    # Command helpers
+    # ------------------------------------------------------------------
+
+    def _help_text(self) -> str:
+        return (
+            "Patreon Watch Dog commands (admin only):\n"
+            "/patreon status - show plugin status\n"
+            "/patreon scan - run a scan now\n"
+            "/patreon campaigns - list Patreon campaigns the token can access\n"
+            "/patreon test - send a test notification to the configured chats\n"
+            "/patreon help - show this help"
+        )
+
+    async def _status_text(self) -> str:
+        """Build a human-readable status snapshot from config and KV data."""
+        creators = self._get_creators()
+        chat_ids = self._get_chat_ids()
+        token_ok = bool(self._cfg_str("patreon_access_token"))
+        tg_ok = bool(self._cfg_str("telegram_bot_token"))
+
+        last_time = ""
+        last_result = ""
+        try:
+            last_time = str(await self.get_kv_data(KV_KEY_LAST_SCAN_TIME, ""))
+        except Exception:
+            pass
+        try:
+            last_result = str(await self.get_kv_data(KV_KEY_LAST_SCAN_RESULT, ""))
+        except Exception:
+            pass
+
+        lines = [
+            "Patreon Watch Dog status:",
+            f"- Scan enabled: {self._cfg_bool('scan_enabled', True)}",
+            f"- Interval: {self._cfg_int('scan_interval_minutes', 30)} min",
+            f"- Creators tracked: {len(creators)}",
+            f"- Telegram bot token set: {tg_ok}",
+            f"- Telegram chat IDs configured: {len(chat_ids)}",
+            f"- Patreon API token set: {token_ok}",
+            f"- Last scan time: {last_time or 'never'}",
+        ]
+        if last_result:
+            try:
+                parsed = json.loads(last_result)
+                lines.append(
+                    "- Last scan result: "
+                    f"new_posts={parsed.get('new_posts', 0)}, "
+                    f"sent={parsed.get('sent', 0)}, "
+                    f"failed={parsed.get('failed', 0)}"
+                )
+            except (TypeError, ValueError):
+                lines.append(f"- Last scan result: {last_result}")
+        return "\n".join(lines)
+
+    async def _campaigns_text(self) -> str:
+        """List campaigns available to the configured Patreon token."""
+        if not self._cfg_str("patreon_access_token"):
+            return "Patreon API token is not configured. Set patreon_access_token first."
+        session = self._http_session
+        if session is None or self._patreon is None:
+            return "Plugin clients are not initialised."
+        try:
+            campaigns = await self._patreon.get_campaigns(session)
+        except Exception as exc:
+            return f"Failed to list campaigns: {exc}"
+        if not campaigns:
+            return "No campaigns found. Check that your token has the 'campaigns' scope."
+        lines = ["Accessible Patreon campaigns:"]
+        for campaign in campaigns:
+            name = campaign["name"] or "(unnamed)"
+            lines.append(f"- {campaign['id']}: {name} ({campaign['url']})")
+        return "\n".join(lines)
+
+    async def _test_notification(self, args: list[str]) -> str:
+        """Send a test notification to every configured chat."""
+        chat_ids = self._get_chat_ids()
+        if not chat_ids:
+            return "No Telegram chat IDs configured."
+        session = self._http_session
+        if session is None or self._notifier is None:
+            return "Plugin clients are not initialised."
+
+        message = (
+            "✅ Patreon Watch Dog test notification.\n"
+            "If you can read this, Telegram notifications are configured correctly."
+        )
+        sent = 0
+        failed = 0
+        for chat_id in chat_ids:
+            ok = await self._notifier.send_text(session, chat_id, message)
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+        return f"Test notification sent: {sent} ok, {failed} failed."
+
+    @staticmethod
+    def _format_summary(summary: dict[str, Any]) -> str:
+        """Render a scan summary for the command reply."""
+        trigger = summary.get("trigger", "manual")
+        errors = summary.get("errors", [])
+        return (
+            f"Patreon scan ({trigger}) finished:\n"
+            f"- Creators: {summary.get('creators', 0)}\n"
+            f"- New posts: {summary.get('new_posts', 0)}\n"
+            f"- Messages sent: {summary.get('sent', 0)}\n"
+            f"- Messages failed: {summary.get('failed', 0)}\n"
+            + (f"- Errors: {errors}" if errors else "")
+        )
