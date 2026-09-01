@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Patreon Watch Dog - 一键测试</title>
+    <link rel="stylesheet" href="./style.css" />
+  </head>
+  <body>
+    <main class="card">
+      <header>
+        <h1>Patreon Watch Dog 测试报告</h1>
+        <p class="desc">
+          获取已配置博主的最新帖子，组装 Markdown 表格并发送到 Telegram 群聊。
+        </p>
+      </header>
+
+      <button id="run-btn" class="btn">▶ 一键测试</button>
+
+      <section id="status" class="status hidden" aria-live="polite"></section>
+
+      <section id="summary" class="summary hidden"></section>
+
+      <section id="errors" class="errors hidden"></section>
+
+      <section class="preview">
+        <h2>报告预览</h2>
+        <pre id="preview"></pre>
+      </section>
+    </main>
+
+    <script type="module" src="./app.js"></script>
+  </body>
+</html>

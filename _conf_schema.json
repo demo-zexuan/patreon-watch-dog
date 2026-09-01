@@ -2,7 +2,7 @@
   "patreon_access_token": {
     "type": "string",
     "description": "Patreon API v2 access token",
-    "hint": "OAuth2 token created at https://www.patreon.com/portal/api/access-token with the 'campaigns' scope. Required to query creator posts.",
+    "hint": "Register an API v2 client at https://www.patreon.com/portal/registration/register-clients (a creator account is required), then copy the Creator's Access Token from the client page.",
     "obvious_hint": true
   },
   "scan_interval_minutes": {

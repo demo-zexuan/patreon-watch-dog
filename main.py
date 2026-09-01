@@ -29,9 +29,20 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.star import Context, Star, register
 
+# Plugin Pages Web API helpers. Pages support needs a recent AstrBot,
+# so keep the import optional to stay compatible with older versions.
+try:
+    from astrbot.api.web import error_response, json_response
+
+    _WEB_AVAILABLE = True
+except ImportError:  # pragma: no cover - depends on the AstrBot version
+    _WEB_AVAILABLE = False
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+PLUGIN_NAME = "astrbot_plugin_patreon_watch_dog"
 
 PATREON_API_BASE = "https://www.patreon.com/api/oauth2/v2"
 TELEGRAM_API_BASE = "https://api.telegram.org"
@@ -46,6 +57,9 @@ STARTUP_DELAY_SECONDS = 10
 MAX_TRACKED_POSTS = 20
 MAX_CONTENT_CHARS = 500
 SCAN_LIMIT = 10
+REPORT_POSTS_LIMIT = 5
+TELEGRAM_MAX_MESSAGE_LENGTH = 4096
+TELEGRAM_KEYBOARD_BLOCK_LIMIT = 3800
 
 KV_KEY_LAST_SEEN = "last_seen_posts:"
 KV_KEY_LAST_SCAN_TIME = "last_scan_time"
@@ -66,7 +80,11 @@ class PatreonClient:
         self._timeout_seconds = max(5, timeout_seconds)
 
     def _headers(self) -> dict[str, str]:
-        return {"Authorization": f"Bearer {self._access_token}"}
+        # Patreon drops requests without an informative User-Agent header.
+        return {
+            "Authorization": f"Bearer {self._access_token}",
+            "User-Agent": f"{PLUGIN_NAME} (AstrBot plugin)",
+        }
 
     async def _get_json(
         self,
@@ -158,7 +176,7 @@ class PatreonClient:
             {
                 "fields[post]": "title,url,content,published_at,post_type,is_public",
                 "sort": "-published_at",
-                "page[size]": str(page_size),
+                "page[count]": str(page_size),
             },
             f"fetch posts of campaign {campaign_id}",
         )
@@ -187,13 +205,18 @@ class TelegramNotifier:
         self._timeout_seconds = max(5, timeout_seconds)
 
     async def send_text(
-        self, session: aiohttp.ClientSession, chat_id: str, text: str
+        self,
+        session: aiohttp.ClientSession,
+        chat_id: str,
+        text: str,
+        parse_mode: str | None = None,
     ) -> bool:
         """Send a text message to a chat.
 
         I. Build the request
             1. chat_id accepts an integer ID or a channel username
             2. parse_mode is only included when configured
+            3. An explicit parse_mode overrides the configured default
         II. Handle the response
             1. A successful response returns True
             2. HTTP 429 retries once after retry_after seconds
@@ -203,9 +226,10 @@ class TelegramNotifier:
             True when Telegram confirms the message was sent.
         """
         url = f"{TELEGRAM_API_BASE}/bot{self._bot_token}/sendMessage"
+        effective_parse_mode = self._parse_mode if parse_mode is None else parse_mode
         payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
-        if self._parse_mode:
-            payload["parse_mode"] = self._parse_mode
+        if effective_parse_mode:
+            payload["parse_mode"] = effective_parse_mode
 
         timeout = aiohttp.ClientTimeout(total=self._timeout_seconds)
         for attempt in range(2):
@@ -265,11 +289,77 @@ def render_template(template: str, values: dict[str, str]) -> str:
         return values.get("post_url", template)
 
 
+def escape_md_cell(value: str) -> str:
+    """Escape a value for a Markdown table cell.
+
+    I. Flatten the value
+        1. Collapse newlines into spaces to keep one row per post
+    II. Escape the pipe character so the table structure stays valid
+    """
+    text = (value or "").strip().replace("\n", " ").replace("|", "\\|")
+    return text or "-"
+
+
+def build_markdown_table(rows: list[dict[str, str]]) -> str:
+    """Build a Markdown table with Creator/Title/Published columns.
+
+    Args:
+        rows: One dict per post with creator_name/post_title/published_at.
+
+    Returns:
+        The Markdown table text without a code-block wrapper.
+    """
+    lines = [
+        "| Creator | Title | Published |",
+        "| --- | --- | --- |",
+    ]
+    for row in rows:
+        lines.append(
+            f"| {escape_md_cell(row.get('creator_name', ''))} "
+            f"| {escape_md_cell(row.get('post_title', ''))} "
+            f"| {escape_md_cell(row.get('published_at', ''))} |"
+        )
+    return "\n".join(lines)
+
+
+def split_markdown_messages(table: str) -> list[str]:
+    """Split a Markdown table into Telegram-safe code-block messages.
+
+    I. Group table lines into chunks
+        1. Keep every message below the Telegram length limit
+        2. Never split a single table line
+    II. Wrap each chunk in a MarkdownV2 code block
+
+    Args:
+        table: The Markdown table text.
+
+    Returns:
+        A list of messages, each wrapped in triple backticks.
+    """
+    if not table.strip():
+        return []
+    lines = table.split("\n")
+    chunks: list[str] = []
+    current: list[str] = []
+    current_size = 0
+    for line in lines:
+        line_size = len(line) + 1
+        if current and current_size + line_size > TELEGRAM_KEYBOARD_BLOCK_LIMIT:
+            chunks.append("\n".join(current))
+            current = []
+            current_size = 0
+        current.append(line)
+        current_size += line_size
+    if current:
+        chunks.append("\n".join(current))
+    return [f"```\n{chunk}\n```" for chunk in chunks]
+
+
 @register(
     "astrbot_plugin_patreon_watch_dog",
     "zexuan.peng",
     "Track Patreon creator updates and notify Telegram groups.",
-    "1.0.0",
+    "1.1.0",
 )
 class PatreonWatchDog(Star):
     """AstrBot plugin that watches Patreon creators for updates."""
@@ -281,6 +371,16 @@ class PatreonWatchDog(Star):
         self._scheduler_task: asyncio.Task | None = None
         self._patreon: PatreonClient | None = None
         self._notifier: TelegramNotifier | None = None
+
+        # Register the backend endpoint used by the "One-click test report"
+        # page in the AstrBot WebUI (requires a recent AstrBot).
+        if _WEB_AVAILABLE:
+            context.register_web_api(
+                f"/{PLUGIN_NAME}/report",
+                self.page_run_report,
+                ["POST"],
+                "Run one-click test report",
+            )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -579,6 +679,108 @@ class PatreonWatchDog(Star):
             logger.warning("Failed to persist scan summary: %s", exc)
 
     # ------------------------------------------------------------------
+    # One-click test report
+    # ------------------------------------------------------------------
+
+    async def _run_report(self) -> dict[str, Any]:
+        """Fetch latest posts of every creator and send a Markdown table.
+
+        I. Validate configuration
+            1. Creators and Telegram destinations must be configured
+        II. Collect posts
+            1. Fetch the latest posts of every configured creator
+            2. Add one row per post to the report table
+        III. Send the report
+            1. Split the table into Telegram-safe code-block messages
+            2. Send every message to every configured chat
+
+        Returns:
+            Report payload used by the WebUI page and the chat command.
+        """
+        report: dict[str, Any] = {
+            "ok": False,
+            "creators": 0,
+            "posts": 0,
+            "sent": 0,
+            "failed": 0,
+            "markdown": "",
+            "errors": [],
+        }
+        creators = self._get_creators()
+        chat_ids = self._get_chat_ids()
+        if not creators:
+            report["errors"].append("No creators configured.")
+            return report
+        if not chat_ids:
+            report["errors"].append("No Telegram chat IDs configured.")
+            return report
+        if self._patreon is None or self._notifier is None:
+            report["errors"].append("Plugin clients are not initialised.")
+            return report
+
+        session = self._http_session or object()
+        rows: list[dict[str, str]] = []
+        report["creators"] = len(creators)
+        for creator in creators:
+            try:
+                posts = await self._patreon.get_latest_posts(
+                    session, creator["campaign_id"], REPORT_POSTS_LIMIT
+                )
+                for post in posts:
+                    rows.append(
+                        {
+                            "creator_name": creator["display_name"],
+                            "post_title": post.get("title", ""),
+                            "published_at": self._format_published_at(
+                                post.get("published_at", "")
+                            ),
+                        }
+                    )
+            except Exception as exc:
+                logger.warning(
+                    "Failed to fetch posts for %s: %s", creator["campaign_id"], exc
+                )
+                report["errors"].append(f"{creator['campaign_id']}: {exc}")
+
+        report["posts"] = len(rows)
+        markdown = build_markdown_table(rows)
+        report["markdown"] = markdown
+        for message in split_markdown_messages(markdown):
+            for chat_id in chat_ids:
+                ok = await self._notifier.send_text(
+                    session, chat_id, message, parse_mode="MarkdownV2"
+                )
+                if ok:
+                    report["sent"] += 1
+                else:
+                    report["failed"] += 1
+        report["ok"] = report["failed"] == 0
+        return report
+
+    async def page_run_report(self):
+        """WebUI handler: run the one-click test report."""
+        try:
+            return json_response(await self._run_report())
+        except Exception as exc:
+            logger.exception("Plugin page report failed.")
+            return error_response(str(exc))
+
+    @staticmethod
+    def _format_report_result(report: dict[str, Any]) -> str:
+        """Render a report payload for the chat command reply."""
+        errors = report.get("errors", [])
+        lines = [
+            "Patreon test report finished:",
+            f"- Creators: {report.get('creators', 0)}",
+            f"- Posts collected: {report.get('posts', 0)}",
+            f"- Messages sent: {report.get('sent', 0)}",
+            f"- Messages failed: {report.get('failed', 0)}",
+        ]
+        if errors:
+            lines.append(f"- Errors: {errors}")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
     # Commands (admin only)
     # ------------------------------------------------------------------
 
@@ -588,7 +790,7 @@ class PatreonWatchDog(Star):
         """Patreon Watch Dog admin commands.
 
         Usage: /patreon <subcommand>
-        Subcommands: help, status, scan, campaigns, test
+        Subcommands: help, status, scan, report, campaigns, test
         """
         text = (event.message_str or "").strip()
         subcommand = _COMMAND_PREFIX_RE.sub("", text).strip().split(" ", 1)[0].lower()
@@ -603,6 +805,10 @@ class PatreonWatchDog(Star):
         if subcommand == "scan":
             summary = await self._run_scan("manual")
             yield event.plain_result(self._format_summary(summary))
+            return
+        if subcommand == "report":
+            report = await self._run_report()
+            yield event.plain_result(self._format_report_result(report))
             return
         if subcommand == "campaigns":
             yield event.plain_result(await self._campaigns_text())
@@ -621,6 +827,7 @@ class PatreonWatchDog(Star):
             "Patreon Watch Dog commands (admin only):\n"
             "/patreon status - show plugin status\n"
             "/patreon scan - run a scan now\n"
+            "/patreon report - collect posts and send a Markdown table report\n"
             "/patreon campaigns - list Patreon campaigns the token can access\n"
             "/patreon test - send a test notification to the configured chats\n"
             "/patreon help - show this help"
