@@ -79,6 +79,8 @@ Default template:
 All commands require admin permissions (see the AstrBot permission settings):
 
 - `/patreon status` — show the current status and the last scan result
+- `/patreon config` — show the current configuration with all secrets masked
+  (handy for checking that your setup is correct)
 - `/patreon scan` — run a scan immediately
 - `/patreon report` — collect the latest post titles of every configured
   creator, build a Markdown table, **show it in the chat** and send it to the
@@ -104,6 +106,13 @@ itself still works on older versions (the button is simply unavailable).
 
 - The first scan records the current latest posts without sending
   notifications. Set `notify_on_first_scan` to change this behavior.
+- The Patreon API v2 only returns posts for campaigns that the token can
+  read. A **Creator's Access Token** can only read the campaign of the
+  creator account that registered the client; trying to read another
+  creator's campaign (e.g. a creator you merely follow) typically returns
+  an **empty post list** or `401`. To track a third-party creator you need
+  an access token that the creator has explicitly authorized for that
+  campaign.
 - When `telegram_parse_mode` is set, escape reserved characters in your
   template (see the Telegram Bot API documentation).
 - Follow the Patreon API terms of service and respect rate limits.

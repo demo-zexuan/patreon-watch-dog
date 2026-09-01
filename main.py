@@ -342,7 +342,13 @@ def build_markdown_table(rows: list[dict[str, str]]) -> str:
     """
     headers = ["Creator", "Title", "Published"]
     if not rows:
-        return "| " + " | ".join(headers) + " |\n| " + " | ".join(["---"] * 3) + " |"
+        # Render a placeholder row so an empty report still looks tidy
+        # instead of showing a bare table skeleton.
+        return (
+            "| " + " | ".join(headers) + " |\n"
+            + "| " + " | ".join(["---"] * len(headers)) + " |\n"
+            + "| " + " | ".join(["—"] * len(headers)) + " |"
+        )
 
     cells = [headers]
     for row in rows:
@@ -399,6 +405,12 @@ def build_report_markdown(rows: list[dict[str, str]], generated_at: str = "") ->
     lines.append(build_markdown_table(rows))
     lines.append("")
     lines.append(f"Total: {len(rows)} posts from tracked creators.")
+    if not rows:
+        lines.append(
+            "No posts returned. The Patreon API returns an empty list for "
+            "campaigns the token cannot read (e.g. a third-party creator); "
+            "the token must own the campaign or be explicitly authorized."
+        )
     return "\n".join(lines)
 
 
@@ -439,7 +451,7 @@ def split_markdown_messages(table: str) -> list[str]:
     "astrbot_plugin_patreon_watch_dog",
     "zexuan.peng",
     "Track Patreon creator updates and notify Telegram groups.",
-    "1.2.0",
+    "1.3.0",
 )
 class PatreonWatchDog(Star):
     """AstrBot plugin that watches Patreon creators for updates."""
@@ -784,6 +796,7 @@ class PatreonWatchDog(Star):
             "failed": 0,
             "markdown": "",
             "errors": [],
+            "notices": [],
         }
         creators = self._get_creators()
         chat_ids = self._get_chat_ids()
@@ -805,6 +818,13 @@ class PatreonWatchDog(Star):
                 posts = await self._patreon.get_latest_posts(
                     session, creator["campaign_id"], REPORT_POSTS_LIMIT
                 )
+                if not posts:
+                    report["notices"].append(
+                        f"{creator['display_name']} ({creator['campaign_id']}): "
+                        "Patreon API returned 0 posts. This is expected when the "
+                        "token cannot read that campaign (it must own the campaign "
+                        "or be explicitly authorized by its creator)."
+                    )
                 for post in posts:
                     rows.append(
                         {
@@ -848,6 +868,7 @@ class PatreonWatchDog(Star):
     def _format_report_result(report: dict[str, Any]) -> str:
         """Render a report payload for the chat command reply."""
         errors = report.get("errors", [])
+        notices = report.get("notices", [])
         lines = [
             "Patreon test report finished:",
             f"- Creators: {report.get('creators', 0)}",
@@ -855,6 +876,10 @@ class PatreonWatchDog(Star):
             f"- Messages sent: {report.get('sent', 0)}",
             f"- Messages failed: {report.get('failed', 0)}",
         ]
+        if notices:
+            lines.append("- Note:")
+            for note in notices:
+                lines.append(f"  • {note}")
         if errors:
             lines.append(f"- Errors: {errors}")
         return "\n".join(lines)
@@ -880,6 +905,9 @@ class PatreonWatchDog(Star):
             return
         if subcommand == "status":
             yield event.plain_result(await self._status_text())
+            return
+        if subcommand == "config":
+            yield event.plain_result(await self._config_text())
             return
         if subcommand == "scan":
             summary = await self._run_scan("manual")
@@ -909,6 +937,7 @@ class PatreonWatchDog(Star):
         return (
             "Patreon Watch Dog commands (admin only):\n"
             "/patreon status - show plugin status\n"
+            "/patreon config - show the current configuration (secrets masked)\n"
             "/patreon scan - run a scan now\n"
             "/patreon report - show and send a Markdown table test report\n"
             "/patreon campaigns - list Patreon campaigns the token can access\n"
@@ -955,6 +984,64 @@ class PatreonWatchDog(Star):
                 )
             except (TypeError, ValueError):
                 lines.append(f"- Last scan result: {last_result}")
+        return "\n".join(lines)
+
+    @staticmethod
+    def _mask_secret(value: str) -> str:
+        """Mask a sensitive value for display in the config command."""
+        value = (value or "").strip()
+        if not value:
+            return "(not set)"
+        if len(value) <= 8:
+            return "••••"
+        return f"{value[:4]}…{value[-4:]}"
+
+    async def _config_text(self) -> str:
+        """Render the current configuration with all secrets masked.
+
+        I. Patreon side
+            1. Access token status (masked)
+            2. Tracked creators
+        II. Scheduling
+            1. Interval, enabled flag and batch limits
+        III. Telegram side
+            1. Bot token status (masked)
+            2. Chat IDs and parse mode
+            3. Message template (truncated)
+        """
+        creators = self._get_creators()
+        chat_ids = self._get_chat_ids()
+        template = self._cfg_str("message_template", DEFAULT_MESSAGE_TEMPLATE)
+        template_snippet = template.replace("\n", " ").strip()
+
+        lines = [
+            "Patreon Watch Dog configuration:",
+            "- Patreon API token: "
+            f"{self._mask_secret(self._cfg_str('patreon_access_token'))}",
+            f"- Scan enabled: {self._cfg_bool('scan_enabled', True)}",
+            f"- Scan interval: {self._cfg_int('scan_interval_minutes', 30)} min",
+            f"- Notify on first scan: {self._cfg_bool('notify_on_first_scan', False)}",
+            f"- Max posts per check: {self._cfg_int('max_posts_per_check', 5)}",
+            f"- Creators ({len(creators)}):",
+        ]
+        for creator in creators:
+            lines.append(f"  • {creator['campaign_id']} ({creator['display_name']})")
+        lines.append(
+            "- Telegram bot token: "
+            f"{self._mask_secret(self._cfg_str('telegram_bot_token'))}"
+        )
+        lines.append(
+            f"- Telegram chat IDs ({len(chat_ids)}): "
+            f"{', '.join(chat_ids) if chat_ids else '(none)'}"
+        )
+        lines.append(
+            "- Telegram parse mode: "
+            f"{self._cfg_str('telegram_parse_mode', '') or '(plain text)'}"
+        )
+        lines.append(f"- Message template: {template_snippet[:120]}")
+        lines.append(
+            f"- Request timeout: {self._cfg_int('request_timeout_seconds', 30)} s"
+        )
         return "\n".join(lines)
 
     async def _campaigns_text(self) -> str:
