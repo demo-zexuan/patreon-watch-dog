@@ -167,14 +167,14 @@ class PatreonClient:
             limit: Maximum number of posts to fetch.
 
         Returns:
-            A list of post dicts with id/title/url/content/published_at/post_type.
+            A list of post dicts with id/title/url/content/published_at.
         """
         page_size = max(1, min(int(limit), 50))
         payload = await self._get_json(
             session,
             f"{PATREON_API_BASE}/campaigns/{campaign_id}/posts",
             {
-                "fields[post]": "title,url,content,published_at,post_type,is_public",
+                "fields[post]": "title,url,content,published_at,is_public",
                 "sort": "-published_at",
                 "page[count]": str(page_size),
             },
@@ -190,7 +190,6 @@ class PatreonClient:
                     "url": str(attributes.get("url") or ""),
                     "content": str(attributes.get("content") or ""),
                     "published_at": str(attributes.get("published_at") or ""),
-                    "post_type": str(attributes.get("post_type") or ""),
                 }
             )
         return posts
@@ -359,7 +358,7 @@ def split_markdown_messages(table: str) -> list[str]:
     "astrbot_plugin_patreon_watch_dog",
     "zexuan.peng",
     "Track Patreon creator updates and notify Telegram groups.",
-    "1.1.0",
+    "1.1.1",
 )
 class PatreonWatchDog(Star):
     """AstrBot plugin that watches Patreon creators for updates."""
@@ -643,7 +642,6 @@ class PatreonWatchDog(Star):
             "post_title": post.get("title", ""),
             "post_url": post.get("url", ""),
             "published_at": self._format_published_at(post.get("published_at", "")),
-            "post_type": post.get("post_type", ""),
             "post_content": self._truncate(post.get("content", ""), MAX_CONTENT_CHARS),
         }
 

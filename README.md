@@ -48,7 +48,7 @@ I. Features
 ### Template placeholders
 
 `{creator_name}`, `{post_title}`, `{post_url}`, `{published_at}`,
-`{post_type}`, `{post_content}` (truncated to 500 chars).
+`{post_content}` (truncated to 500 chars).
 
 Default template:
 

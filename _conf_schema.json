@@ -66,7 +66,7 @@
   "message_template": {
     "type": "text",
     "description": "Notification message template",
-    "hint": "Placeholders: {creator_name}, {post_title}, {post_url}, {published_at}, {post_type}, {post_content}",
+    "hint": "Placeholders: {creator_name}, {post_title}, {post_url}, {published_at}, {post_content}",
     "default": "🔔 {creator_name} posted a new update!\n📄 {post_title}\n🔗 {post_url}"
   },
   "telegram_parse_mode": {

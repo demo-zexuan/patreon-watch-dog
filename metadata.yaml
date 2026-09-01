@@ -13,7 +13,7 @@ name: astrbot_plugin_patreon_watch_dog # Unique plugin identifier
 display_name: Patreon Watch Dog # Human-friendly name shown in the WebUI
 desc: Track Patreon creator updates and send Telegram group notifications.
 short_desc: Patreon creator update watcher with Telegram notifications.
-version: v1.1.0 # Plugin version, format: v1.1.1 or v1.1
+version: v1.1.1 # Plugin version, format: v1.1.1 or v1.1
 author: zexuan.peng
 repo: https://github.com/zexuan.peng/patreon-watch-dog
 support_platforms:
