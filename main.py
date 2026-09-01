@@ -20,6 +20,7 @@ import asyncio
 import json
 import re
 import string
+import unicodedata
 from datetime import datetime, timezone
 from typing import Any
 
@@ -299,25 +300,105 @@ def escape_md_cell(value: str) -> str:
     return text or "-"
 
 
+def _display_width(text: str) -> int:
+    """Return the terminal display width of a string.
+
+    East-Asian wide characters (CJK, full width, many emoji) occupy two
+    columns in monospace clients, so they must count as width 2 when
+    padding the table cells.
+    """
+    width = 0
+    for char in text:
+        width += 2 if unicodedata.east_asian_width(char) in ("W", "F") else 1
+    return width
+
+
+def _pad_display(text: str, width: int) -> str:
+    """Pad a string with spaces up to a target display width."""
+    return text + " " * max(0, width - _display_width(text))
+
+
 def build_markdown_table(rows: list[dict[str, str]]) -> str:
-    """Build a Markdown table with Creator/Title/Published columns.
+    """Build a well-aligned Markdown table with Creator/Title/Published.
+
+    I. Normalise the cells
+        1. Apply Markdown escaping to every cell
+        2. Missing values render as "-"
+    II. Align the columns
+        1. Pad every cell to the longest display width in its column
+        2. Wide CJK/emoji characters are counted as two columns so the
+           table lines up in monospace clients (Telegram code blocks,
+           terminal, Markdown preview)
+    III. Assemble the table
+        1. Header row
+        2. Separator row widened to match the column widths
+        3. One row per post
 
     Args:
         rows: One dict per post with creator_name/post_title/published_at.
 
     Returns:
-        The Markdown table text without a code-block wrapper.
+        The aligned Markdown table text without a code-block wrapper.
     """
-    lines = [
-        "| Creator | Title | Published |",
-        "| --- | --- | --- |",
-    ]
+    headers = ["Creator", "Title", "Published"]
+    if not rows:
+        return "| " + " | ".join(headers) + " |\n| " + " | ".join(["---"] * 3) + " |"
+
+    cells = [headers]
     for row in rows:
-        lines.append(
-            f"| {escape_md_cell(row.get('creator_name', ''))} "
-            f"| {escape_md_cell(row.get('post_title', ''))} "
-            f"| {escape_md_cell(row.get('published_at', ''))} |"
+        cells.append(
+            [
+                escape_md_cell(row.get("creator_name", "")),
+                escape_md_cell(row.get("post_title", "")),
+                escape_md_cell(row.get("published_at", "")),
+            ]
         )
+
+    widths = [
+        max(_display_width(cell) for cell in column) for column in zip(*cells)
+    ]
+    lines = [
+        "| "
+        + " | ".join(_pad_display(cell, width) for cell, width in zip(headers, widths))
+        + " |",
+        "| " + " | ".join("-" * width for width in widths) + " |",
+    ]
+    for row_cells in cells[1:]:
+        lines.append(
+            "| "
+            + " | ".join(
+                _pad_display(cell, width) for cell, width in zip(row_cells, widths)
+            )
+            + " |"
+        )
+    return "\n".join(lines)
+
+
+def build_report_markdown(rows: list[dict[str, str]], generated_at: str = "") -> str:
+    """Build the complete one-click test report document.
+
+    I. Heading
+        1. Report title
+        2. Generation timestamp
+    II. Body
+        1. The aligned Markdown table
+        2. A summary line with the total post count
+
+    Args:
+        rows: One dict per post with creator_name/post_title/published_at.
+        generated_at: ISO timestamp (UTC) of the report generation.
+
+    Returns:
+        The full report document used by the chat command, the Telegram
+        notification and the WebUI page preview.
+    """
+    lines = ["📊 Patreon Posts Test Report"]
+    if generated_at:
+        lines.append(f"Generated: {generated_at}")
+    lines.append("")
+    lines.append(build_markdown_table(rows))
+    lines.append("")
+    lines.append(f"Total: {len(rows)} posts from tracked creators.")
     return "\n".join(lines)
 
 
@@ -358,7 +439,7 @@ def split_markdown_messages(table: str) -> list[str]:
     "astrbot_plugin_patreon_watch_dog",
     "zexuan.peng",
     "Track Patreon creator updates and notify Telegram groups.",
-    "1.1.1",
+    "1.2.0",
 )
 class PatreonWatchDog(Star):
     """AstrBot plugin that watches Patreon creators for updates."""
@@ -741,7 +822,7 @@ class PatreonWatchDog(Star):
                 report["errors"].append(f"{creator['campaign_id']}: {exc}")
 
         report["posts"] = len(rows)
-        markdown = build_markdown_table(rows)
+        markdown = build_report_markdown(rows, self._now_iso())
         report["markdown"] = markdown
         for message in split_markdown_messages(markdown):
             for chat_id in chat_ids:
